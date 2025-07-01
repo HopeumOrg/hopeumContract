@@ -13,6 +13,15 @@ docs/
 # Dotenv file
 .env
 
+# Libs
+lib/
 
 # Soldeer
-/dependencies
+dependencies/
+
+
+# Deployment
+DEPLOYMENT.md
+
+# Scripts
+script/ 

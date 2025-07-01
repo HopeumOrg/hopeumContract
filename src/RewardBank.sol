@@ -14,7 +14,7 @@ contract RewardBank is Ownable(msg.sender), Pausable, ReentrancyGuard {
     event Withdraw(address indexed token, address indexed to,   uint256 amount);
 
     constructor() {
-        _transferOwnership(msg.sender); 
+        _transferOwnership(msg.sender);
     }
 
 

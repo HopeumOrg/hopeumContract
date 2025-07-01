@@ -6,6 +6,18 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+interface IERC20Mintable {
+    function mint(address to, uint256 amount) external;
+}
+
+interface IERC20Burnable {
+    function burnFrom(address account, uint256 amount) external;
+}
+
+interface IERC20Metadata {
+    function decimals() external view returns (uint8);
+}
+
 contract StakingPools is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
@@ -21,7 +33,14 @@ contract StakingPools is ReentrancyGuard, Ownable {
         bool isActive; // Whether the pool is active
         bool canWithdrawStake; // Whether staked tokens can be withdrawn
         uint256 minStakeAmount; // Minimum amount required to stake
+        bool isCollateralized; // true if this pool uses collateral token
+        address collateralToken; // token address for the collateral token (must be mintable/burnable)
+        bool isNative; // true = this pool accepts native token (ETH), false = ERC20
+        uint8 collateralTokenDecimals;
+        uint256 collateralPrice; // e.g., 3000000000000000 for 0.003 (if 18 decimals)
     }
+
+    bool public globalPause;
 
     struct UserStake {
         uint256 amount; // Amount staked by user
@@ -63,6 +82,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
     );
     event PoolUpdated(uint256 indexed poolId, uint256 newApy);
     event PoolClosed(uint256 indexed poolId);
+    event RewardDeposited(address rewardToken, uint256 amount);
 
     constructor() Ownable(msg.sender) {}
 
@@ -82,6 +102,11 @@ contract StakingPools is ReentrancyGuard, Ownable {
         _;
     }
 
+    modifier notPausedGlobal() {
+        require(!globalPause, "Global pause active");
+        _;
+    }
+
     // Owner functions
     function createPool(
         address _stakeToken,
@@ -90,9 +115,27 @@ contract StakingPools is ReentrancyGuard, Ownable {
         uint256 _duration,
         uint256 _startTime,
         bool _canWithdrawStake,
-        uint256 _minStakeAmount
+        uint256 _minStakeAmount,
+        bool _isCollateralized,
+        address _collateralToken,
+        bool _isNative,
+        uint256 _collateralPrice
     ) external onlyOwner returns (uint256) {
-        require(_stakeToken != address(0), "Invalid stake token");
+        if (_isCollateralized) {
+            require(_collateralToken != address(0), "Invalid collateral token");
+        }
+
+        if (_isNative) {
+            require(
+                _stakeToken == address(0),
+                "Native token pool must use address(0)"
+            );
+        }
+        require(
+            _stakeToken != address(0) || _isNative,
+            "Invalid stake token for non-native pool"
+        );
+
         require(_rewardToken != address(0), "Invalid reward token");
         require(_apy > 0, "APY must be greater than 0");
         require(_duration > 0, "Duration must be greater than 0");
@@ -100,6 +143,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
             _startTime >= block.timestamp,
             "Start time must be in the future"
         );
+        require(_collateralPrice > 0, "Invalid collateral price");
 
         uint256 poolId = poolCount;
         pools[poolId] = Pool({
@@ -113,7 +157,14 @@ contract StakingPools is ReentrancyGuard, Ownable {
             isPaused: false,
             isActive: true,
             canWithdrawStake: _canWithdrawStake,
-            minStakeAmount: _minStakeAmount
+            minStakeAmount: _minStakeAmount,
+            isCollateralized: _isCollateralized,
+            collateralToken: _isCollateralized ? _collateralToken : address(0),
+            isNative: _isNative,
+            collateralTokenDecimals: _isCollateralized
+                ? IERC20Metadata(_collateralToken).decimals()
+                : 18,
+            collateralPrice: _isCollateralized ? _collateralPrice : 0
         });
 
         poolCount++;
@@ -175,67 +226,113 @@ contract StakingPools is ReentrancyGuard, Ownable {
     }
 
     // User functions
+
+    // Todo: Consider making collateral token based on percent of total pool
+    // TODO: Add totalCollateralMinted to Pool struct → allows accurate tracking.
+    // TODO: No pool lock-in or reward lock
+
     function stake(
+        uint256 _poolId,
+        uint256 _amount
+    )
+        external
+        payable
+        nonReentrant
+        poolExists(_poolId)
+        poolActive(_poolId)
+        notPausedGlobal
+        poolNotPaused(_poolId)
+    {
+        Pool storage pool = pools[_poolId];
+        require(block.timestamp >= pool.startTime, "Pool not started yet");
+        require(block.timestamp < pool.endTime, "Pool has ended");
+
+        uint256 amountToStake = pool.isNative ? msg.value : _amount;
+
+        require(amountToStake > 0, "Amount must be greater than 0");
+        require(
+            amountToStake >= pool.minStakeAmount,
+            "Amount below minimum stake"
+        );
+
+        UserStake storage userStake = userStakes[_poolId][msg.sender];
+
+        // Handle token transfer
+        if (pool.isNative) {
+            // ETH received automatically — nothing to transfer
+        } else {
+            IERC20 stakeToken = IERC20(pool.stakeToken);
+            stakeToken.safeTransferFrom(
+                msg.sender,
+                address(this),
+                amountToStake
+            );
+        }
+
+        // If user already has stake, claim rewards first
+        if (userStake.amount > 0) {
+            _claimReward(_poolId, msg.sender);
+        } else {
+            userStake.lastClaimTime = block.timestamp;
+        }
+
+        // Update stake
+        userStake.amount += amountToStake;
+        userStake.stakedAt = block.timestamp;
+
+        // Update pool total
+        pool.totalStaked += amountToStake;
+
+        // Collateralized mint
+        if (pool.isCollateralized) {
+            uint8 decimals = pool.collateralTokenDecimals;
+            uint256 scale = 10 ** uint256(decimals); // e.g., 10^6, 10^18
+            uint256 userShare = (amountToStake * pool.collateralPrice) /
+                (1e18 / scale);
+            IERC20Mintable(pool.collateralToken).mint(msg.sender, userShare);
+        }
+
+        emit Staked(_poolId, msg.sender, amountToStake);
+    }
+
+    function withdraw(
         uint256 _poolId,
         uint256 _amount
     )
         external
         nonReentrant
         poolExists(_poolId)
-        poolActive(_poolId)
+        notPausedGlobal
         poolNotPaused(_poolId)
     {
         Pool storage pool = pools[_poolId];
-        require(block.timestamp >= pool.startTime, "Pool not started yet");
-        require(block.timestamp < pool.endTime, "Pool has ended");
-        require(_amount > 0, "Amount must be greater than 0");
-        require(_amount >= pool.minStakeAmount, "Amount below minimum stake");
-
-        UserStake storage userStake = userStakes[_poolId][msg.sender];
-
-        // Transfer tokens from user to this contract using SafeERC20
-        IERC20 stakeToken = IERC20(pool.stakeToken);
-        stakeToken.safeTransferFrom(msg.sender, address(this), _amount);
-
-        // If user already has a stake, claim rewards first
-        if (userStake.amount > 0) {
-            _claimReward(_poolId, msg.sender);
-        } else {
-            // Initialize new stake
-            userStake.lastClaimTime = block.timestamp;
-        }
-
-        // Update user stake
-        userStake.amount += _amount;
-        userStake.stakedAt = block.timestamp;
-
-        // Update pool total staked
-        pool.totalStaked += _amount;
-
-        emit Staked(_poolId, msg.sender, _amount);
-    }
-
-    function withdraw(
-        uint256 _poolId,
-        uint256 _amount
-    ) external nonReentrant poolExists(_poolId) poolNotPaused(_poolId) {
-        Pool storage pool = pools[_poolId];
         require(pool.canWithdrawStake, "Stake withdrawal not allowed");
+
         UserStake storage userStake = userStakes[_poolId][msg.sender];
         require(userStake.amount >= _amount, "Insufficient staked amount");
 
-        // Claim rewards before withdrawal
         _claimReward(_poolId, msg.sender);
 
-        // Update user stake
         userStake.amount -= _amount;
-
-        // Update pool total staked
         pool.totalStaked -= _amount;
 
-        // Transfer tokens back to user using SafeERC20
-        IERC20 stakeToken = IERC20(pool.stakeToken);
-        stakeToken.safeTransfer(msg.sender, _amount);
+        if (pool.isCollateralized) {
+            uint256 scale = 10 ** uint256(pool.collateralTokenDecimals);
+            uint256 burnAmount = (_amount * pool.collateralPrice) /
+                (1e18 / scale);
+            IERC20Burnable(pool.collateralToken).burnFrom(
+                msg.sender,
+                burnAmount
+            );
+        }
+
+        if (pool.isNative) {
+            (bool success, ) = payable(msg.sender).call{value: _amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            IERC20 stakeToken = IERC20(pool.stakeToken);
+            stakeToken.safeTransfer(msg.sender, _amount);
+        }
 
         emit Withdrawn(_poolId, msg.sender, _amount);
     }
@@ -246,25 +343,38 @@ contract StakingPools is ReentrancyGuard, Ownable {
         _claimReward(_poolId, msg.sender);
     }
 
+    // Loses accumulated rewards
     function emergencyWithdraw(
         uint256 _poolId
     ) external nonReentrant poolExists(_poolId) {
         Pool storage pool = pools[_poolId];
         require(pool.canWithdrawStake, "Stake withdrawal not allowed");
+
         UserStake storage userStake = userStakes[_poolId][msg.sender];
         require(userStake.amount > 0, "No stake to withdraw");
 
         uint256 amount = userStake.amount;
 
-        // Reset user stake first to prevent reentrancy
         userStake.amount = 0;
-
-        // Update pool total staked
         pool.totalStaked -= amount;
 
-        // Transfer tokens back to user using SafeERC20
-        IERC20 stakeToken = IERC20(pool.stakeToken);
-        stakeToken.safeTransfer(msg.sender, amount);
+        if (pool.isCollateralized) {
+            uint256 scale = 10 ** uint256(pool.collateralTokenDecimals);
+            uint256 burnAmount = (amount * pool.collateralPrice) /
+                (1e18 / scale);
+            IERC20Burnable(pool.collateralToken).burnFrom(
+                msg.sender,
+                burnAmount
+            );
+        }
+
+        if (pool.isNative) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            require(success, "ETH transfer failed");
+        } else {
+            IERC20 stakeToken = IERC20(pool.stakeToken);
+            stakeToken.safeTransfer(msg.sender, amount);
+        }
 
         emit EmergencyWithdrawn(_poolId, msg.sender, amount);
     }
@@ -362,7 +472,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
         IERC20 token = IERC20(_rewardToken);
         token.safeTransferFrom(msg.sender, address(this), _amount);
 
-        rewardTokenBalances[_rewardToken] += _amount;
+        emit RewardDeposited(_rewardToken, _amount);
     }
 
     function withdrawRewardTokens(
@@ -385,7 +495,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
     function getRewardTokenBalance(
         address _rewardToken
     ) external view returns (uint256) {
-        return rewardTokenBalances[_rewardToken];
+        return IERC20(_rewardToken).balanceOf(address(this));
     }
 
     // Emergency function to recover ERC20 tokens sent to contract by mistake
@@ -414,18 +524,26 @@ contract StakingPools is ReentrancyGuard, Ownable {
         address rewardToken = pools[_poolId].rewardToken;
 
         // Check if contract has enough reward tokens
-        require(
-            rewardTokenBalances[rewardToken] >= reward,
-            "Insufficient reward token balance"
-        );
-
-        // Update reward token balance
-        rewardTokenBalances[rewardToken] -= reward;
-
-        // Transfer reward tokens using SafeERC20
         IERC20 token = IERC20(rewardToken);
+        uint256 availableReward = token.balanceOf(address(this));
+
+        require(availableReward >= reward, "Insufficient reward token balance");
+
         token.safeTransfer(_user, reward);
 
         emit RewardClaimed(_poolId, _user, reward);
+    }
+
+    function updateCollateralPrice(
+        uint256 _poolId,
+        uint256 _newPrice
+    ) external onlyOwner poolExists(_poolId) {
+        require(pools[_poolId].isCollateralized, "Pool is not collateralized");
+        require(_newPrice > 0, "Invalid collateral price");
+        pools[_poolId].collateralPrice = _newPrice;
+    }
+
+    function setGlobalPause(bool _paused) external onlyOwner {
+        globalPause = _paused;
     }
 }
