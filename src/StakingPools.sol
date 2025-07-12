@@ -46,12 +46,12 @@ contract StakingPools is ReentrancyGuard, Ownable {
         uint256 amount; // Amount staked by user
         uint256 stakedAt; // Time when user staked
         uint256 lastClaimTime; // Last time rewards were claimed
+        uint256 entryPrice; // Collateral price at time of staking (for collateralized pools)
     }
 
     uint256 public poolCount;
     mapping(uint256 => Pool) public pools;
     mapping(uint256 => mapping(address => UserStake)) public userStakes;
-    mapping(address => uint256) public rewardTokenBalances; // Track reward token balances
 
     // Events
     event PoolCreated(
@@ -83,6 +83,19 @@ contract StakingPools is ReentrancyGuard, Ownable {
     event PoolUpdated(uint256 indexed poolId, uint256 newApy);
     event PoolClosed(uint256 indexed poolId);
     event RewardDeposited(address rewardToken, uint256 amount);
+    event PoolMinStakeUpdated(
+        uint256 indexed poolId,
+        uint256 newMinStakeAmount
+    );
+    event PoolDurationExtended(
+        uint256 indexed poolId,
+        uint256 additionalTime,
+        uint256 newEndTime
+    );
+    event CollateralPriceUpdated(
+        uint256 indexed poolId,
+        uint256 newCollateralPrice
+    );
 
     constructor() Ownable(msg.sender) {}
 
@@ -143,7 +156,11 @@ contract StakingPools is ReentrancyGuard, Ownable {
             _startTime >= block.timestamp,
             "Start time must be in the future"
         );
-        require(_collateralPrice > 0, "Invalid collateral price");
+
+        // Only validate collateral price for collateralized pools
+        if (_isCollateralized) {
+            require(_collateralPrice > 0, "Invalid collateral price");
+        }
 
         uint256 poolId = poolCount;
         pools[poolId] = Pool({
@@ -194,6 +211,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
         uint256 _minStakeAmount
     ) external onlyOwner poolExists(_poolId) poolActive(_poolId) {
         pools[_poolId].minStakeAmount = _minStakeAmount;
+        emit PoolMinStakeUpdated(_poolId, _minStakeAmount);
     }
 
     function pausePool(
@@ -220,16 +238,18 @@ contract StakingPools is ReentrancyGuard, Ownable {
         uint256 _additionalTime
     ) external onlyOwner poolExists(_poolId) poolActive(_poolId) {
         require(_additionalTime > 0, "Additional time must be greater than 0");
+        require(
+            block.timestamp < pools[_poolId].endTime,
+            "Cannot extend ended pool"
+        );
+
         Pool storage pool = pools[_poolId];
         pool.duration += _additionalTime;
         pool.endTime += _additionalTime;
+
+        emit PoolDurationExtended(_poolId, _additionalTime, pool.endTime);
     }
 
-    // User functions
-
-    // Todo: Consider making collateral token based on percent of total pool
-    // TODO: Add totalCollateralMinted to Pool struct → allows accurate tracking.
-    // TODO: No pool lock-in or reward lock
 
     function stake(
         uint256 _poolId,
@@ -246,6 +266,14 @@ contract StakingPools is ReentrancyGuard, Ownable {
         Pool storage pool = pools[_poolId];
         require(block.timestamp >= pool.startTime, "Pool not started yet");
         require(block.timestamp < pool.endTime, "Pool has ended");
+
+        // Prevent accidental ETH loss in non-native pools
+        if (!pool.isNative) {
+            require(
+                msg.value == 0,
+                "Do not send native token to non-native pool"
+            );
+        }
 
         uint256 amountToStake = pool.isNative ? msg.value : _amount;
 
@@ -276,6 +304,21 @@ contract StakingPools is ReentrancyGuard, Ownable {
             userStake.lastClaimTime = block.timestamp;
         }
 
+        // Calculate weighted average entry price for collateralized pools
+        if (pool.isCollateralized) {
+            if (userStake.amount > 0) {
+                // Calculate weighted average: (existingAmount * existingPrice + newAmount * currentPrice) / totalAmount
+                uint256 totalAmount = userStake.amount + amountToStake;
+                userStake.entryPrice =
+                    ((userStake.amount * userStake.entryPrice) +
+                        (amountToStake * pool.collateralPrice)) /
+                    totalAmount;
+            } else {
+                // First stake, use current price
+                userStake.entryPrice = pool.collateralPrice;
+            }
+        }
+
         // Update stake
         userStake.amount += amountToStake;
         userStake.stakedAt = block.timestamp;
@@ -285,10 +328,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
 
         // Collateralized mint
         if (pool.isCollateralized) {
-            uint8 decimals = pool.collateralTokenDecimals;
-            uint256 scale = 10 ** uint256(decimals); // e.g., 10^6, 10^18
-            uint256 userShare = (amountToStake * pool.collateralPrice) /
-                (1e18 / scale);
+            uint256 userShare = (amountToStake * pool.collateralPrice) / 1e18;
             IERC20Mintable(pool.collateralToken).mint(msg.sender, userShare);
         }
 
@@ -317,9 +357,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
         pool.totalStaked -= _amount;
 
         if (pool.isCollateralized) {
-            uint256 scale = 10 ** uint256(pool.collateralTokenDecimals);
-            uint256 burnAmount = (_amount * pool.collateralPrice) /
-                (1e18 / scale);
+            uint256 burnAmount = (_amount * userStake.entryPrice) / 1e18;
             IERC20Burnable(pool.collateralToken).burnFrom(
                 msg.sender,
                 burnAmount
@@ -359,9 +397,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
         pool.totalStaked -= amount;
 
         if (pool.isCollateralized) {
-            uint256 scale = 10 ** uint256(pool.collateralTokenDecimals);
-            uint256 burnAmount = (amount * pool.collateralPrice) /
-                (1e18 / scale);
+            uint256 burnAmount = (amount * userStake.entryPrice) / 1e18;
             IERC20Burnable(pool.collateralToken).burnFrom(
                 msg.sender,
                 burnAmount
@@ -481,14 +517,13 @@ contract StakingPools is ReentrancyGuard, Ownable {
     ) external onlyOwner {
         require(_rewardToken != address(0), "Invalid reward token");
         require(_amount > 0, "Amount must be greater than 0");
+
+        IERC20 token = IERC20(_rewardToken);
         require(
-            rewardTokenBalances[_rewardToken] >= _amount,
+            token.balanceOf(address(this)) >= _amount,
             "Insufficient reward token balance"
         );
 
-        rewardTokenBalances[_rewardToken] -= _amount;
-
-        IERC20 token = IERC20(_rewardToken);
         token.safeTransfer(msg.sender, _amount);
     }
 
@@ -541,6 +576,7 @@ contract StakingPools is ReentrancyGuard, Ownable {
         require(pools[_poolId].isCollateralized, "Pool is not collateralized");
         require(_newPrice > 0, "Invalid collateral price");
         pools[_poolId].collateralPrice = _newPrice;
+        emit CollateralPriceUpdated(_poolId, _newPrice);
     }
 
     function setGlobalPause(bool _paused) external onlyOwner {

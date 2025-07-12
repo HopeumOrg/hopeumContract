@@ -38,4 +38,21 @@ contract MockERC20 is ERC20 {
     function burn(uint256 amount) external {
         _burn(msg.sender, amount);
     }
+
+    /**
+     * @dev Burns tokens from a specified account with allowance
+     * @param account The account from which tokens will be burned
+     * @param amount The amount of tokens to burn
+     */
+    function burnFrom(address account, uint256 amount) external {
+        uint256 currentAllowance = allowance(account, msg.sender);
+        if (currentAllowance != type(uint256).max) {
+            require(
+                currentAllowance >= amount,
+                "ERC20: burn amount exceeds allowance"
+            );
+            _approve(account, msg.sender, currentAllowance - amount);
+        }
+        _burn(account, amount);
+    }
 }
